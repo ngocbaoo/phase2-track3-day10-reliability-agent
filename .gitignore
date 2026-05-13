@@ -4,4 +4,4 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 *.pyc
-*/day10_reliability_agent_lab.egg-info/
+src/day10_reliability_agent_lab.egg-info/
