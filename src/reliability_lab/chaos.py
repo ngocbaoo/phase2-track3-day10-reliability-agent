@@ -73,25 +73,42 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     """Run a single named chaos scenario."""
     gateway = build_gateway(config, scenario.provider_overrides or None)
     metrics = RunMetrics()
+    concurrency = getattr(config.load_test, "concurrency", 1)
     request_count = config.load_test.requests
-    for _ in range(request_count):
+    
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    lock = threading.Lock()
+    
+    def process_one() -> None:
         prompt = random.choice(queries)
         result = gateway.complete(prompt)
-        metrics.total_requests += 1
-        metrics.estimated_cost += result.estimated_cost
-        if result.cache_hit:
-            metrics.cache_hits += 1
-            metrics.estimated_cost_saved += 0.001
-        if result.route == "fallback":
-            metrics.fallback_successes += 1
-            metrics.successful_requests += 1
-        elif result.route == "static_fallback":
-            metrics.static_fallbacks += 1
-            metrics.failed_requests += 1
-        else:
-            metrics.successful_requests += 1
-        if result.latency_ms:
-            metrics.latencies_ms.append(result.latency_ms)
+        with lock:
+            metrics.total_requests += 1
+            metrics.estimated_cost += result.estimated_cost
+            if result.cache_hit:
+                metrics.cache_hits += 1
+                metrics.estimated_cost_saved += 0.001
+            if result.route.startswith("fallback"):
+                metrics.fallback_successes += 1
+                metrics.successful_requests += 1
+            elif result.route == "static_fallback":
+                metrics.static_fallbacks += 1
+                metrics.failed_requests += 1
+            else:
+                metrics.successful_requests += 1
+            if result.latency_ms:
+                metrics.latencies_ms.append(result.latency_ms)
+
+    if concurrency > 1:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(process_one) for _ in range(request_count)]
+            for f in as_completed(futures):
+                f.result()
+    else:
+        for _ in range(request_count):
+            process_one()
 
     metrics.circuit_open_count = sum(
         1 for breaker in gateway.breakers.values() for t in breaker.transition_log if t["to"] == "open"
@@ -101,11 +118,6 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
@@ -116,9 +128,15 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        if scenario.name == "primary_timeout_100":
+            passed = result.fallback_successes / max(1, result.total_requests) > 0.8
+        elif scenario.name == "primary_flaky_50":
+            passed = result.circuit_open_count > 0 and result.successful_requests > 0
+        elif scenario.name == "all_healthy":
+            passed = result.fallback_successes == 0 and result.successful_requests == result.total_requests
+        else:
+            passed = result.successful_requests > 0
+
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
